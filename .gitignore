@@ -1,0 +1,17 @@
+build*/
+results/
+*.o
+*.a
+radix_coherence
+coherence_tests
+
+# Performance executables and generated logs
+architecture_perf
+performance_tests
+*.log
+.DS_Store
+
+# Standalone test/probe executables
+dlrm_tests
+directory_tests
+cpu_coherence_probe
