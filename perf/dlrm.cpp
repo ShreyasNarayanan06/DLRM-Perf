@@ -2,11 +2,10 @@
 #include <algorithm>
 #include <cmath>
 #include <random>
+#include <numeric>
 
 namespace perf {
 namespace {
-constexpr std::uint64_t hot_base = 1ULL << 44;
-constexpr std::uint64_t cold_base = 1ULL << 48;
 constexpr std::uint64_t scratch_base = 1ULL << 52;
 double uniform(std::mt19937_64& rng) {
     // Specify the conversion instead of relying on library-specific distributions.
@@ -20,8 +19,15 @@ std::size_t hot_lines(const Config& c) {
     return std::clamp(static_cast<std::size_t>(std::llround(static_cast<double>(c.table_lines) * c.hot_fraction)),
                       std::size_t{1}, c.table_lines - 1);
 }
+std::vector<std::uint64_t> embedding_rows(const Config& c) {
+    std::vector<std::uint64_t> rows(c.table_lines); std::iota(rows.begin(),rows.end(),0);
+    std::mt19937_64 layout(c.layout_seed);
+    for(std::size_t n=rows.size();n>1;--n) std::swap(rows[n-1],rows[choose(layout,n)]);
+    return rows;
+}
 Workload make_dlrm_workload(const Config& c) {
     const auto hot = hot_lines(c), cold = c.table_lines - hot;
+    const auto rows=embedding_rows(c);
     std::vector<double> cdf(hot);
     double sum = 0;
     for (std::size_t i = 0; i < hot; ++i) {
@@ -31,10 +37,9 @@ Workload make_dlrm_workload(const Config& c) {
     for (auto& value : cdf) value /= sum;
     const auto hot_address = [&](std::mt19937_64& rng) {
         const auto it = std::lower_bound(cdf.begin(), cdf.end(), uniform(rng));
-        return hot_base + static_cast<std::uint64_t>(std::min(hot - 1,
-            static_cast<std::size_t>(it - cdf.begin()))) * 64;
+        return embedding_base + rows[std::min(hot - 1,static_cast<std::size_t>(it - cdf.begin()))] * 64;
     };
-    Phase phase{"inference_with_online_updates", {}, false};
+    Phase phase{"inference_with_online_updates", {}, true};
     for (std::size_t node = 0; node <= c.agents; ++node) {
         // Independent streams keep accelerator traces stable when host cadence changes.
         std::mt19937_64 rng(c.seed + 0x9e3779b97f4a7c15ULL * node);
@@ -49,10 +54,10 @@ Workload make_dlrm_workload(const Config& c) {
                 gather.sync_step = 2 * r;
                 if (c.hot_update_every != 0 && (r + 1) % c.hot_update_every == 0)
                     for (std::size_t u = 0; u < c.hot_updates; ++u)
-                        gather.accesses.push_back({AccessKind::HotEmbeddings, hot_address(rng), true, {}});
+                        gather.accesses.push_back({AccessKind::HotEmbeddings, hot_address(rng), true});
                 if (c.cold_update_every != 0 && (r + 1) % c.cold_update_every == 0)
                     for (std::size_t u = 0; u < c.cold_updates; ++u)
-                        gather.accesses.push_back({AccessKind::ColdEmbeddings, cold_base + choose(rng, cold) * 64, true, {}});
+                        gather.accesses.push_back({AccessKind::ColdEmbeddings, embedding_base + rows[hot+choose(rng,cold)] * 64, true});
             } else {
                 // Bottom MLP uses dense features independently of sparse gathers.
                 // Top MLP starts only after both embedding gathers and bottom MLP finish.
@@ -61,17 +66,17 @@ Workload make_dlrm_workload(const Config& c) {
                 for (std::size_t a = 0; a < c.sparse_reads; ++a) {
                     const bool is_hot = uniform(rng) < c.hot_read_fraction;
                     gather.accesses.push_back({is_hot ? AccessKind::HotEmbeddings : AccessKind::ColdEmbeddings,
-                        is_hot ? hot_address(rng) : cold_base + choose(rng, cold) * 64, false, {}});
+                        is_hot ? hot_address(rng) : embedding_base + rows[hot+choose(rng,cold)] * 64, false});
                 }
                 mlp.compute_ns = (1 - c.bottom_fraction) * c.compute_ns;
                 const auto base = scratch_base + node * (1ULL << 32);
                 for (std::size_t a = 0; a < c.scratch_writes; ++a) {
                     const auto line = ((r * c.scratch_writes + a) / c.stores_per_line) % c.scratch_lines;
-                    mlp.accesses.push_back({AccessKind::PrivateScratchpad, base + line * 64, true, {}});
+                    mlp.accesses.push_back({AccessKind::PrivateScratchpad, base + line * 64, true});
                 }
                 for (std::size_t a = 0; a < c.scratch_reads; ++a) {
                     const auto line = ((r * c.scratch_writes) / c.stores_per_line + a) % c.scratch_lines;
-                    mlp.accesses.push_back({AccessKind::PrivateScratchpad, base + line * 64, false, {}});
+                    mlp.accesses.push_back({AccessKind::PrivateScratchpad, base + line * 64, false});
                 }
             }
             stream.steps.push_back(std::move(gather));

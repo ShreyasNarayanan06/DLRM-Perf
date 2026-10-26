@@ -11,12 +11,11 @@ namespace perf {
 class DirectoryModel {
 public:
     explicit DirectoryModel(const Config& config);
-    double reserve(double arrival, std::uint64_t key, double weight, AccessKind kind);
-    struct Lookup { bool retry; double time; };
-    Lookup lookup(double now, std::uint64_t key, double weight, AccessKind kind);
+    double reserve(double arrival, std::uint64_t key, AccessKind kind);
+    struct Lookup { bool retry; double time; bool miss=false; };
+    Lookup lookup(double now, std::uint64_t key, AccessKind kind);
     const std::array<DirectoryStats, kind_count>& stats() const { return stats_; }
-    static std::uint64_t line_key(std::uint64_t address) { return (address / 64) * 2; }
-    static std::uint64_t region_key(std::uint64_t address, std::size_t bytes) { return (address / bytes) * 2 + 1; }
+    static std::uint64_t line_key(std::uint64_t address) { return address / 64; }
 private:
     struct Entry { double ready; std::list<std::uint64_t>::iterator lru; };
     const Config& c_;

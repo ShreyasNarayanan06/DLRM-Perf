@@ -23,27 +23,22 @@ DirectoryStats DirectoryStats::operator-(const DirectoryStats& r) const {
     return d;
 }
 DirectoryModel::DirectoryModel(const Config& c) : c_(c), banks_(c.directory_banks,0) {}
-double DirectoryModel::reserve(double arrival, std::uint64_t key, double weight, AccessKind kind) {
+double DirectoryModel::reserve(double arrival, std::uint64_t key, AccessKind kind) {
     auto& stats=stats_[index(kind)]; ++stats.requests;
-    if (!c_.directory_model) return arrival;
     // Mix both namespaces without sending all even line keys to half the banks.
     auto hash=key+0x9e3779b97f4a7c15ULL;
     hash=(hash^(hash>>30))*0xbf58476d1ce4e5b9ULL;
     hash=(hash^(hash>>27))*0x94d049bb133111ebULL; hash^=hash>>31;
     auto& available=banks_[hash % banks_.size()];
     const auto start=std::max(arrival,available);
-    const auto busy=c_.directory_issue_ns*weight;
+    const auto busy=c_.directory_issue_ns;
     available=start+busy;
     stats.bank_wait_ns+=start-arrival; stats.bank_busy_ns+=busy;
     return start;
 }
-DirectoryModel::Lookup DirectoryModel::lookup(double now, std::uint64_t key, double weight, AccessKind kind) {
+DirectoryModel::Lookup DirectoryModel::lookup(double now, std::uint64_t key, AccessKind kind) {
     auto& stats=stats_[index(kind)];
-    const auto hit_service=c_.directory_ns*weight;
-    if (!c_.directory_model) {
-        ++stats.hits; stats.service_ns+=hit_service;
-        return {false,now+hit_service};
-    }
+    const auto hit_service=c_.directory_ns;
     auto found=entries_.find(key);
     if (found!=entries_.end()) {
         const auto ready=found->second.ready;
@@ -80,9 +75,9 @@ DirectoryModel::Lookup DirectoryModel::lookup(double now, std::uint64_t key, dou
     }
     ++stats.misses; stats.read_bytes+=64;
     const auto start=std::max(now,backing_available_);
-    const auto busy=static_cast<double>(bytes)*weight/c_.directory_backing_gbps;
+    const auto busy=static_cast<double>(bytes)/c_.directory_backing_gbps;
     backing_available_=start+busy;
-    const auto done=backing_available_+hit_service+c_.directory_miss_ns*weight;
+    const auto done=backing_available_+hit_service+c_.directory_miss_ns;
     stats.backing_wait_ns+=start-now; stats.backing_busy_ns+=busy; stats.service_ns+=done-now;
     misses_.push(done);
     if (c_.directory_entries!=0) {
@@ -90,6 +85,6 @@ DirectoryModel::Lookup DirectoryModel::lookup(double now, std::uint64_t key, dou
     }
     stats.peak_misses=std::max(stats.peak_misses,misses_.size());
     stats.peak_entries=std::max(stats.peak_entries,entries_.size());
-    return {false,done};
+    return {false,done,true};
 }
 } // namespace perf

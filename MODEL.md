@@ -1,287 +1,210 @@
-# Model and interpretation
+# Timed baseline profiler: definitions and limits
 
-This is a C++17 discrete-event performance sensitivity model. It generates logical
-memory traces, profiles them with a finite-cache directory reference model, then
-schedules those measured model events using configurable latency and byte budgets.
-It does not train or implement a particular sharing predictor or optimized coherence
-protocol. The names of the three counterfactual scenarios describe cost assumptions.
-The separate legacy `radix_coherence` executable is retained from `agentic-perf`;
-its predictor, oracle, state switches and stall estimates are not used by `perf/`.
+`architecture_perf` now runs **one always-coherent MESI-style baseline**, then
+analyzes its observed addresses at 64B, 256B, 1KiB and 4KiB. There are no scenario
+fractions, predictor hints, page bypass modes, speculative speedups or state-change
+budgets in this frontend. The block sizes are analysis lenses over the same 64B
+baseline, not four simulated coherence protocols. The independent original
+`radix_coherence` executable remains a legacy project and is not used by `perf/`.
 
-## Workloads
+## Mixed DLRM layout
 
-`--workload radix` preserves the lead-agent/fork/parallel-child/completion lifecycle.
-The lead fills a prefix, three children repeatedly gather it while updating their
-own leaves, and host and accelerators contend on tree metadata. `--workload dlrm`
-uses one host and N inference streams; `--workload both` runs both traces with the
-same `Config` hardware fields and reports speedup against each trace's own baseline.
-Different workloads do different amounts of work: elapsed time across workloads is
-not an equal-work throughput comparison.
+One contiguous table starts at `embedding_base` and contains `table_lines` rows,
+with one modeled 64B line per row. A seeded Fisher–Yates permutation selects hot
+ranks throughout that table. The first `round(table_lines * hot_fraction)` shuffled
+rows are hot candidates; the rest are cold candidates. Thus hot and cold rows share
+pages. Layout seed and request seed are independent, exposed inputs.
 
-DLRM has three disjoint page-aligned address ranges:
+The generator still chooses 80% of accelerator sparse reads from the hot set using
+a Zipf rank distribution and 20% uniformly from the cold set. The host periodically
+updates rows from those same sets. These choices are synthetic workload inputs;
+the profiler does not receive heat classifications. Hot/cold `AccessKind` values
+remain optional diagnostic labels in `.kinds.csv` and event logs. They never select
+cache behavior, directory service, histogram membership or mode transitions. A
+label-permutation test verifies identical timing, cache/miss distributions and
+address histograms after labels are changed.
 
-| Class | Default logical footprint | Access pattern |
-|---|---:|---|
-| HotEmbeddings | 205 of 4096 table lines (5.005%) | 80% of accelerator gathers; Zipf rank exponent 1.1; host writes 2 sampled hot lines every 4 batches |
-| ColdEmbeddings | Remaining 3891 lines, about 243 KiB | 20% uniform scattered gathers; host writes 1 sampled cold line every 32 batches |
-| PrivateScratchpad | 128 lines = 8 KiB per accelerator | 8 logical stores and 2 reads per batch; four sequential logical stores per line; ownership checked |
+This hot-set Zipf plus uniform-tail mixture is not a single full-table Zipf law.
+The optional address-based skew analyzer reports observed rank curves and an
+independent calibrated full-table Zipf sample; it does not change simulation input.
+See [SKEW_PROFILE.md](SKEW_PROFILE.md) for the equation, measured concentration,
+cache-filtered fills and calibration limits.
 
-Hot and cold arrays are independently page-aligned: 5% refers to *logical table
-addresses*, not padded allocated pages. Caches start empty; embeddings start
-initialized in shared memory. Host writes can touch previously unused preallocated
-entries, but allocator resizing, pointer metadata and insertion algorithms are not
-modeled. Scratch stores represent activations or other private buffers, not an
-explicit accelerator training computation.
+The `embeddings` output space is selected numerically by the contiguous table's
+address bounds. `all` includes every address, including private scratch and Radix
+metadata/KV. Keeping both views prevents private scratch traffic from concealing
+the table's behavior. All statistical groups are keyed by addresses, not labels.
 
-Each accelerator batch has two stages. Bottom MLP dense-feature compute (40% of
-`compute_ns`) runs independently of the sparse embedding gathers. Top MLP compute
-(the other 60%) starts after **both** bottom compute and all gathers complete, then
-issues scratch writes/reads. The following batch cannot issue gathers before the
-current scratch memory batch completes. The general timing engine permits one
-next-step compute lookahead after `ceil(overlap_trigger * batch_request_count)`
-completions; this remains enabled for RadixTree. The DLRM gather-to-top edge disables
-lookahead to respect the data dependency. `--bottom-fraction 0 --overlap-trigger 1`
-disables compute/memory overlap in DLRM. Compute is a configurable timing budget,
-not an executed tensor kernel or FLOP model.
+An independent PRNG stream per node preserves accelerator request addresses when
+host cadence changes. Scratch buffers remain separate per-accelerator allocations,
+with reads/stores and sequential line reuse. Dense bottom compute may overlap
+embedding gathers; top compute waits for both before scratch accesses. Host batch r
+cannot start its memory requests before accelerator 1 starts gather r. Cadence is
+in logical batches, not periodic wall-clock arrivals.
 
-The host has two matching stages per batch, with `host_compute_ns` per gather
-stage. Host batch r cannot issue its updates before accelerator 1 starts gather r.
-It may lag if its own preceding updates take longer. This paces the concurrent
-stream instead of letting all updates complete at time zero. Cadence is in logical
-batches, not wall-clock arrivals. Setting an update interval to zero disables that
-stream. Per-node `mt19937_64` seeds and an explicit uniform-to-Zipf CDF sampler keep
-accelerator addresses unchanged when host cadence is edited. Repeated runs on the
-validated compilers give identical trace fingerprints; tiny floating-point CDF
-boundary differences remain possible across other math libraries.
+## Timing-driven functional memory state
 
-## Reference events and finite caches
+`profile.cpp` is now an incremental `BaselineMemory` component. It no longer
+walks the trace in round-robin order before simulation. A request goes through:
 
-`profile.cpp` reuses `RegionStateMachine` with **Policy::Baseline only**: 64B lines,
-one exclusive E/M owner or clean shared copies, write invalidations, dirty-owner
-writeback on intervention, and version invariants. Each node, including the host,
-has a fully associative finite LRU of `cache_bytes / 64` lines shared by its memory
-classes. Invalidated entries are removed before capacity selection. Dirty eviction
-writes back 64B; repeated writes with local exclusive permission are hits. Zero
-cache capacity disables retention. There is no infinite accelerator cache and no
-flat coherence tax on every logical request.
+1. A bounded per-node outstanding window, then admission when its line and a data
+   cache slot/victim are available. Admission consults current committed data state.
+2. Upstream CXL permission requests / eviction notices, with FIFO serialization.
+3. Timed home-directory bank/tag/miss-buffer/backing work, if permission or eviction
+   bookkeeping is required. Eviction metadata and demand metadata are separate ops.
+4. Data/peer service and snoop/invalidation/writeback service budgets.
+5. Response/data serialization on the shared CXL resource, then functional commit.
 
-The profile is deterministically ordered by phase, step ordinal, access ordinal,
-then stream/node order. DLRM host accesses are in gather stages interleaved with
-accelerator gathers; they do not all precede inference. Counters are exact for this
-abstract directory and specified logical interleaving, **not ground-truth hardware
-MESI measurements**. Data-cache set conflicts, MOESI Owned state, prefetchers, data-cache ports and
-detailed DRAM data banks are not modeled. Home-directory capacity and timing
-resources are described below.
+Cache fills are not valid before commit. Writes advance the line version at commit;
+readers return the newest committed version in their serialized access order.
+Invalidations remove actual remote cache entries at commit. Dirty-owner intervention
+and dirty victim writeback update memory before ownership/data become visible.
+Version and owner/sharer invariants are checked throughout completion processing.
+A test changes only memory latency and observes a different read version, access
+order and writeback count, demonstrating that timing feeds back into coherence.
 
-Timing changes do **not** feed back into cache/coherence interleaving. Host pacing
-controls when profiled work can be issued, but is not a timing-driven cache
-consistency simulation. Actual update/read races could change the directory events
-and therefore the result. This is the main accuracy limit to resolve before using
-numbers as an architecture performance prediction.
+Data caches are finite fully associative LRUs. Pending fills reserve capacity.
+Victim selection skips lines with active operations; if no slot/victim is available,
+the request waits without holding its target lock. Target/victim reservations are
+acquired atomically to avoid eviction dependency deadlocks. Dirty victim data stays
+inaccessible to conflicting operations until its writeback completes. Cached reads
+of a line can overlap; misses/upgrades/writes serialize at line granularity.
+A queued exclusive request prevents later cached readers from indefinitely passing
+it. The FIFO event tie-break is a deterministic sequence number.
 
-## Four cost scenarios
+A first clean read may receive E permission; a remote read of E/M requires an
+owner snoop and downgrade. A dirty owner supplies a writeback. Subsequent reads of
+clean S copies add a sharer through the directory. A write to S requests permission
+and invalidates other copies; repeated local E/M writes are hits. Data hits on
+write upgrade can still require a directory lookup. With `cache_bytes=0`, no data
+is retained and writes use an explicitly modeled write-through/RFO approximation.
 
-1. **Baseline Always-Coherent:** all observed directory, snoop, invalidation and
-   writeback events retain their configured costs. No region-mode tax.
-2. **Cold RO + Private Scratchpad Bypass:** cold reads and private scratch accesses
-   retain none of their reference directory/snoop/invalidation budgets. Hot events
-   retain full costs. Each new bypass page pays a grant/barrier. A cold host write
-   broadcasts revocation to all endpoints, evicts every cached copy on that page,
-   obtains normal coherent write permission, and flushes/publishes the update
-   before read-only access resumes. A write to an as-yet ungranted page needs no
-   pre-revocation but still pays clean publication. For RadixTree this row applies
-   the equivalent prefix/leaf hint, retaining metadata coherence.
-3. **Naive Coarse Region Coherence:** all memory classes receive bypass budgets.
-   Any write with remote cached copies anywhere on its page revokes the whole
-   page, evicting valid copies at all endpoints. Other-line copies are counted as
-   collateral false sharing. Dirty data is flushed, a recovery/barrier is charged,
-   and the write is published clean. A remote read of a page containing dirty
-   remote lines downgrades/flushes the whole page, even if the requested line is
-   clean. An owner-only scratch write does not spuriously revoke its page. These
-   are transparent page-cost rules, not a proposed adaptive coherence policy.
-4. **50% KV/Embedding Overhead Reduction:** halve the *reference directory/snoop/
-   invalidation* latency and control-byte budgets for all KV/embedding/scratch
-   accesses, including hot embeddings. Radix metadata stays fully coherent.
-   Reference hit/fill behavior is preserved, except for explicitly moving prefix
-   dirty publication to the fork. It does not halve data transfer, writebacks,
-   compute or total application time. This is a broader hypothetical capability
-   than selective bypass, so the two rows need not have a fixed ordering.
+The implementation uses abstract data versions rather than embedding values.
+This is a concrete MESI-style baseline model, not measured hardware ground truth.
 
-RO bypass has no precise per-line sharer directory to provide free knowledge of
-readers: grant/revocation/publication broadcasts cost `directory_bytes * (N + 2)`
-(endpoint exchanges plus commit). Private grants cost two exchanges. Each barrier
-adds `region_barrier_ns`; initial grants also add `setup_ns`. Explicit unexpected
-writes add `recovery_ns` and `recovery_bytes`. Revocation applies to actual valid
-cached copies, not all 64 lines unconditionally. Dirty revocation/publication costs
-`ceil(region_flushes / outstanding) * (memory_ns + writeback_ns)` in service waves;
-its 64B per dirty line traverses the shared link **once**. These penalties are
-conservative budgets, not calibrated protocol message schedules. Home directory metadata for both line permissions and region operations shares
-the finite cache and controller below. Accelerator-local region permission caches
-and a separate barrier-engine bandwidth limit are not modeled.
+## Finite directory and link
 
-All counterfactual Radix rows additionally pay `fork_barrier_ns + setup_ns +
-prefix_regions * region_barrier_ns`, control exchanges and bounded outstanding
-dirty-prefix publication. DLRM has no artificial fork. The 50% budget alone has
-an expected residual recovery tax: `recovery_rate` per non-metadata access requiring
-a reference directory event, default 1%, plus `recovery_ns`/bytes. It is a fractional
-expected-cost sensitivity, not randomly observed mispredictions. The two explicit
-page-hint rows instead count actual page write recoveries, avoiding double charging.
-`added_latency_ns` is an optional per-logical-KV/embedding/scratch hint-check cost.
+The home metadata cache is a memory-backed fully associative LRU, with hashed bank
+issue slots and bounded metadata miss buffers. Pending tag fills cannot be evicted
+or treated as immediate hits. Lookups can merge into an existing pending metadata
+fill, while data-line transactions remain serialized separately. Evicting metadata
+writes its modified owner/sharer record to backing memory; it **does not** invalidate
+data caches or discard permissions. Permission updates and data-cache eviction
+notices both probe the directory. A miss is attributed to the exact probed address,
+including a victim address for an eviction notice.
 
-## Finite home directory (refinement)
+Default assumptions: 1,024 metadata entries, four banks, 2ns issue interval, 16 miss
+buffers, 20ns tag lookup, 80ns extra backing service and 32GB/s metadata backing
+bandwidth. One metadata cache entry/transfer is modeled as 64B. Record packing,
+set conflicts and actual product directory layouts are not calibrated. Metadata
+backing uses its own channel, separate from CXL and data-memory service.
 
-`directory.hpp` / `directory.cpp` isolate the new controller model. Defaults are
-**1,024 cached entries, four banks, 2 ns issue interval per bank, 16 metadata miss
-buffers, 20 ns tag lookup latency, 80 ns additional backing service, and 32 GB/s
-local metadata backing bandwidth**. These are explicit synthetic assumptions,
-not measurements or specifications for Great Lakes, a GPU or a CXL product.
-A metadata entry occupies one modeled 64B transaction. A real compressed directory
-may pack more entries per transaction and have very different cache coverage.
-This proof of concept omits that spatial packing, which can overstate metadata
-misses and backing traffic. The miss-cost/capacity sweeps expose sensitivity but
-do not substitute for a hardware directory-layout measurement.
+The CXL link is one shared FIFO serialization resource covering both directions.
+Requests blocked on cache/line resources do not reserve future link slots. Demand
+permission requests charge `directory_bytes`; data-cache eviction notices charge
+8B. Response snoop/invalidation controls use their configured budgets. Fills and
+dirty data writebacks each transfer 64B. Metadata backing traffic is separate.
+Data/peer service, snoop/invalidation service and dirty writeback latency remain
+configurable abstract costs. Eviction and demand directory work are serialized
+within each transaction. Bank pipelines and misses can overlap other transactions.
 
-Every retained coherent permission request accesses a line entry. Each page grant,
-revocation/publication barrier or dirty-read downgrade also accesses a region entry
-in the **same** finite resource. Line/page keys occupy disjoint namespaces, so
-bypass does not get a free unlimited home permission store. Banks are address-hashed;
-issue rate is separate from lookup latency, allowing pipelined hits. Port requests
-are queued in arrival order per bank. Actual tag probes run as chronological events.
+## Observation windows and exact denominators
 
-A missing entry fetches 64B from a memory-backed directory. Active owner/sharer
-changes make cached entries dirty; replacing one writes back 64B of **metadata**.
-This traffic uses a separately modeled, bandwidth-limited home backing channel,
-not the CXL data link. Dirty replacement plus fetch consumes two backing transfers;
-backing service is pipelined. Metadata cache eviction **does not invalidate data
-caches** or discard permissions: backing memory preserves the full directory.
+`scope=all` covers the full run. `scope=measured` covers phases marked measured;
+with positive warm-up, the first `warmup_rounds` inference/child batches are excluded.
+Data caches, directory state, PRNG streams and addresses persist across warm-up.
+The boundary drains outstanding work and synchronizes streams. Radix lead/setup
+and final completion are excluded when warm-up is enabled. Without warm-up the
+entire workload is measured. Post-warm-up does not imply statistical stationarity.
 
-Miss buffers are bounded. A full miss-buffer set stalls new tag misses while hits
-can pass. A pending metadata entry cannot be evicted or treated as an immediate
-hit: repeated lookups merge with its fill and wait for readiness. If all metadata
-cache entries are pending, replacement waits for one to become ready. Retried
-probes do not count as extra logical requests. `directory_entries=0` disables
-metadata retention, so every permission probe misses. Metadata state and data
-LRUs carry across phases and the warm-up boundary.
+Each logical request is observed **once at successful memory admission**, before
+its directory service, rather than once per retry or when the CPU issues it into
+a blocked window. Time distributions use these admission timestamps. Optional event
+logs record issue, admission, completion and exact admission order, making waits
+and tie ordering explicit. Metadata misses are recorded at actual timed tag probes.
 
-The 50% overhead row retains every reference lookup, but halves the non-metadata
-lookup latency, issue-slot occupancy, backing service and backing bandwidth budget.
-Its cache tags still occupy full entries. This is an event-equivalent cost
-sensitivity, not a physical implementation that somehow transmits half of a dirty
-metadata line. Raw metadata byte counters remain whole transactions; backing busy
-time reports the retained cost. Page-hint rows instead eliminate their bypassed
-per-line probes while paying full-cost region operations and coherent hot probes.
+### Distinct-accessor histogram (`.sharers.csv`)
 
-`--directory-model 0` reproduces the previous timing path exactly, including its
-fixed directory latency and page scheduling. The new path holds line/page
-operations through actual controller completion; thus the toggle also changes that
-scheduling detail for page hints. It is a legacy reference, not a pure isolated
-capacity ablation. `directory_entries`, `directory_banks`, `directory_issue_ns`,
-`directory_mshrs`, `directory_miss_ns` and `directory_backing_gbps` independently
-expose resource and latency sensitivity. Eviction notices still use the existing
-8B/4ns approximation; they do not separately probe the cached home directory.
+For each touched block, take the union of node IDs that admitted a demand access
+within the observation window. Report how many blocks have 1, 2, ... N+1 distinct
+accessors (host 0 is included). Percentages use **demand-touched blocks** as the
+denominator. This is historical accessor count, not simultaneous resident MESI
+sharers and not proof of a block's current ownership. Metadata-only probes do not
+create a demand accessor or inflate the denominator.
 
-This is a cached, memory-backed directory design assumption. Some hardware uses
-an inclusive finite snoop filter whose eviction back-invalidates cached data; this
-model does **not** implement that alternative. The [gem5 CHI model documentation](https://www.gem5.org/documentation/general_docs/ruby/CHI/)
-describes controller pipeline and finite transaction resources that motivate
-modeling these bottlenecks. Our small controller is not a CHI implementation or a
-replacement for a calibrated full-system simulator.
+### Read runs and write intervals
 
-## Warm-up and longer traces
+`.read_runs.csv` gives exact counts of consecutive reads between writes to the same
+address block. `.write_intervals.csv` gives corresponding admission-time durations
+in logarithmic `[2^k, 2^(k+1))` ns bins, plus an explicit point mass at zero.
+Read counts are exact, including zero-read intervals between consecutive writes.
+Both exports distinguish:
 
-`--rounds 512 --warmup-rounds 128` runs all 512 logical batches and reports a
-separate measurement of the final 384. Host cadence, scratch cursors, PRNG streams,
-data caches and directory state continue from warm-up. The boundary drains
-outstanding work and synchronizes streams; no reset, extra cache flush or synthetic
-transition is added. This barrier can affect inter-stream timing, so it is not a
-fully uninterrupted trace measurement.
+- `closed`: bounded by two observed writes. Only these are complete intervals.
+- `left_censored`: reads from window start until the first write; the preceding
+  write is outside the window or unknown. Zero-read leading intervals are retained.
+- `right_censored`: reads after the final observed write until window end.
+- `both_censored`: no write was observed for the block during the entire window.
 
-For DLRM, warm-up and measured inference phases are separated. For RadixTree,
-lead/fork setup, the first 128 child rounds, and final completion work are outside
-the measured window. The remaining child rounds are measured. Default
-`warmup_rounds=0` retains the whole execution, including setup/completion. A positive
-warm-up must be smaller than `rounds`. Post-warm-up is not automatically stationary:
-large random address spaces can keep encountering new lines throughout measurement.
+Censored durations/read counts are observed lower bounds on phase length. Long
+read-only blocks are therefore not silently dropped or claimed to have infinite
+reuse. Percentages are within each run type; they are not access-weighted rates.
+Unobserved blocks contribute no run samples. Simultaneous admissions to different
+lines in a larger block use deterministic admission order; that tie order is not a
+physical total order guaranteed by hardware.
 
-CSV totals keep whole-run semantics. `measured_execution_us` and
-`measured_execution_reduction_pct` compare just the measured windows. `_kinds.csv`
-contains `scope=all` and `scope=measured`; `_phases.csv` marks measured phases. New
-directory counters distinguish hits, misses, merged fills, dirty metadata evictions,
-bank queue wait, miss-buffer wait, pending-entry capacity wait, backing queue wait,
-and separate backing read/write bytes. Per-kind directory counters attribute work
-to the triggering request class; this includes backing writes of displaced
-metadata. Data-cache eviction/writeback counters still use the actual victim class.
-Directory peak occupancy fields are run-wide maxima, including in measured rows;
-counts, service and waits in measured rows exclude warm-up.
+### Spatial purity (`.spatial.csv`)
 
-## Timing and metrics
+Within each block/window, track distinct touched 64B lines. A written line has at
+least one observed write. A read-only line has at least one observed read and zero
+observed writes in that window. Categories are `read_only_blocks`,
+`written_lines_only_blocks` and `mixed_blocks` (both written and read-only lines).
+A written line may also have reads; "written lines only" does not mean write-only
+operations. Untouched lines are excluded. A 64B block cannot be spatially mixed.
 
-Eligible requests enter a FIFO link shared by host and accelerators. Link serialization
-is `bytes / bandwidth_gbps`, with GB/s interpreted as decimal bytes/ns. Data fills
-and writebacks each transfer 64B. Service latency follows serialization; it can
-pipeline with other requests. Page- or fill-dependent requests are rescheduled at
-their eligible time before joining the link queue, so they do not reserve future
-link slots while unrelated requests wait. With the finite directory enabled,
-same-line dependencies are held until actual completion through the controller,
-not an optimistic timestamp calculated before queuing. Same-node same-line accesses wait for
-prior service; bypass page grants and recovery operations also gate the page and
-wait for previously issued page accesses. Each node has at most `outstanding`
-issued memory operations, including pending operations blocked by these dependencies.
-No extra MLP comes from compute lookahead. Phases join at the last completion.
+`mixed_pct` is the fraction of **demand-touched blocks**, not the fraction of
+allocated pages, accesses or bytes. Embedding exports also give the allocated
+block count, including the final partial block; `allocated_blocks=0` in the `all`
+space means allocation coverage is undefined across disjoint address ranges.
 
-For each access the modeled completion is:
+### Directory miss attribution (`.miss_attribution.csv`)
 
-```
-eligible = max(batch_issue_time, same_node_line_ready, applicable_page_gate)
-link_done = max(eligible, link_available) + (fill_bytes + writeback_bytes + control_bytes) / GBps
-directory_done = queued_line_lookups_and_region_operations(link_done)
-completion = directory_done + (fill ? memory_or_peer_ns : hit_ns)
-           + retained(snoop_ns * snoops + invalidate_ns * invalidations)
-           + writeback_ns * non_region_writebacks + 4ns * capacity_evictions
-           + explicit_region_service + expected_recovery_service + optional_check_service
-```
+Classify blocks using zero vs positive **observed** writes, after the selected
+window has finished. A later write changes the final classification of earlier
+misses; no hot/cold label or first-touch guess is used. Counts are metadata cache
+misses, not all directory probes and not data-cache misses. They are exported for
+`lookup_origin=demand`, `eviction` and `all`. Percentages use the total misses for
+the same scope/space/block size/origin.
 
-All scenarios conservatively retain an 8B/4ns capacity-eviction notice. Counterfactual
-budget changes scale only directory/snoop/invalidation events, never the data or
-dirty flush payload. `peer_ns` applies when a line has another exclusive owner;
-this is not a modeled CXL fabric topology. A single serialization resource covers
-both directions and control/data traffic. Queue wait, worker compute, memory wait,
-overlap and event latency are *aggregate request/worker quantities*, not additive
-critical-path components. Execution time is the actual final event timestamp.
+Both `write_window=scope` and `whole_run` are provided. Thus a block evicted during
+measurement after a warm-up write can be zero-write in the measured window while
+written in whole-run history. A metadata-only block can have no demand access in
+measurement yet contribute miss attribution; it is excluded from spatial/accessor
+denominators. These are workload-history statements, not guarantees of immutability.
 
-`--csv` exports totals, estimated time, time reduction versus the same workload's
-baseline, trace fingerprint, hardware/workload configuration and all page penalties.
-`--kinds` exports both whole-run and measured-window reads, writes, cache hits, fills, directory lookups, snoops,
-invalidations, writebacks, evictions and region events by memory class **for each
-scenario**. Capacity evictions and writebacks are attributed to the actual victim memory
-class, even when another class triggers them; service time remains on that request.
-Fork writebacks are separate. Baseline rows
-are the reference event counts. Counterfactual raw events describe the reference
-bookkeeping after explicit page revocations; they are not claimed to be literal
-transactions of an implemented bypass protocol. `charged_*_events` are retained
-*event-equivalent latency budgets* and may be fractional in the 50% row. Actual
-transmitted byte budgets are in `control_bytes`; grants/revocations are additional
-messages. `region_recoveries`, `region_downgrades`, `region_grants` and
-`region_barriers` expose permission work; `collateral_copies` isolates false sharing.
+`.blocks.csv` contains the underlying address-level counts, node counts, written
+and read-only line counts, whole-run write counts, and demand/eviction miss counts.
+This supports alternative weights or analysis without heat-based aggregation.
 
-The link combines request/response bytes before directory and memory service;
-this is a lumped transaction timing model, not separate protocol packet round trips.
-The directory backing channel is modeled separately from DRAM data service, so
-metadata/data contention at a shared physical memory controller remains unmodeled.
-Snoop/invalidation processing still uses additive event budgets; it has no separate
-controller queue. Finite controller queues improve resource realism but do **not**
-fix the earlier static functional cache/coherence interleaving limitation.
+## Output interpretation and remaining limits
 
-The costs are assumptions, not measurements of GPUs or CXL on Great Lakes. The
-cluster runs validate C++ code and determinism. Default results include cold-start
-and finite 64-batch phases, not an isolated steady-state measurement. A cache-fitting
-run still pays first-touch permissions, hot host invalidations and rare cold page
-updates. The default cold address space exceeds cache capacity, but its short
-64-batch sampled trace does not fill the entire cache: default cold misses are
-largely first touches. The 4 KiB cache-exceeding regime explicitly exercises
-capacity evictions. A new seed or transition budget can change benefit size and sign.
+`.metrics.csv` / `.kinds.csv` report ordinary baseline hits, fills, permission
+lookups, snoops, invalidations and writebacks. `directory_lookups` counts demand
+permission probes; `directory_requests` additionally includes eviction notices.
+Dirty data evictions/writebacks are attributed to the actual victim label in the
+optional diagnostic class table; event-row service counts include all work caused
+by that request. Metadata replacement counters belong to the probed request class.
+Wait/service counters are aggregates, not additive critical-path fractions. Peak
+resource occupancy fields are run-wide maxima, also in measured diagnostics.
 
-Workload structure follows the dense-feature MLP, sparse embedding and top MLP
-organization documented by the [original DLRM project](https://github.com/facebookresearch/dlrm).
-The chosen skew, host cadence, footprints and nanosecond budgets are exposed synthetic
-research inputs, not a claim that all production DLRM deployments behave this way.
+The model still omits cache-set conflicts, cache ports, data-miss coalescing across
+requesters, TLB/page walks, DRAM data banks, precise protocol packet networks,
+shared metadata/data memory-controller contention and real DLRM tensor kernels.
+Same-line transaction serialization is conservative. The single-row=64B layout,
+Zipf skew, update cadence, compute and nanosecond costs are synthetic inputs.
+External insertion/allocation algorithms and unmodeled agents are not represented.
+
+These distributions can identify candidate granularity and phase thresholds. An
+optimal policy additionally requires transition cost, correctness rules, prediction
+error and hardware validation. Neither historical sharers nor observed zero writes
+alone establishes that a block can safely bypass coherence in the future.

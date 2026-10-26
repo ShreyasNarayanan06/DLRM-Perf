@@ -1,50 +1,46 @@
-# DLRM-Perf: policy-neutral RadixTree / DLRM performance simulator
+# DLRM / RadixTree baseline memory profiler
 
-The refined simulator adds a **finite, banked, memory-backed directory**, bounded
-metadata miss buffers, and **512-batch runs with 128 warm-up batches**. Under the
-exposed default directory assumptions, selective bypass reduces post-warm-up DLRM
-time **23.97%**, while the cache-fitting case becomes **17.23% slower** because
-page recovery discards useful cached data.
+The timed baseline now uses **one mixed embedding address space** and updates
+finite caches and MESI permissions during execution. The old counterfactual
+scenarios have been removed from `perf/`. Its outputs describe the workload at
+64B, 256B, 1KiB and 4KiB so a coherence policy can be designed from observations.
 
-The assumed metadata-miss penalty matters: on the same long DLRM trace, selective
-bypass saves **8.15% with 0 ns extra miss latency**, **12.18% at 20 ns**, **23.97% at
-80 ns**, and **35.55% at 160 ns**. These are conditional simulation results, not
-measured GPU/CXL speedups. The added mechanisms make resource limits explicit;
-the new default nanosecond values are not hardware calibration.
+**Access-skew check:** the hottest 205 of 4,096 rows (about 5%) account for
+**79.96% of measured logical embedding reads**. A standalone full-table Zipf
+sampler can also be calibrated to an exact 80% target.
+[Distribution, sample validation and reproduction commands](SKEW_PROFILE.md).
 
-## Post-warm-up results
+## First results: mixed DLRM embeddings
 
-Each case runs 512 rounds and excludes the first 128 from measurement. Positive
-percentages mean less time versus that workload's own always-coherent baseline;
-negative values mean slower. Both workloads use identical hardware within a case.
+Default: 3 accelerators + host, 512 batches, 128 warm-up batches, 64KiB data
+cache/node, 256KiB embedding table, request seed 42, layout seed 7.
 
-| Case | Workload | Baseline measured µs | Selective time reduction | Naive coarse time reduction | 50% budget time reduction |
-|---|---|---:|---:|---:|---:|
-| long_default | radix | 94.858 | 0.00% | -1,182.51% | 0.00% |
-| long_default | dlrm | 172.791 | 23.97% | -77.05% | 13.15% |
-| long_fitting | radix | 94.858 | 0.00% | -1,182.51% | 0.00% |
-| long_fitting | dlrm | 102.773 | -17.23% | -167.52% | 2.22% |
-| long_exceeding | radix | 1,778.048 | 38.17% | 15.71% | 18.44% |
-| long_exceeding | dlrm | 379.316 | 23.04% | -2.28% | 13.05% |
-| long_bandwidth | radix | 7,244.040 | 22.12% | 20.45% | 10.81% |
-| long_bandwidth | dlrm | 1,067.794 | 8.28% | 3.51% | 8.80% |
+| Analysis block size | Touched blocks | One historical accessor | Mixed written/read-only lines | Metadata misses on zero-write blocks |
+|---|---:|---:|---:|---:|
+| 64 B | 3,485 | 42.93% | 0.00% | 98.51% |
+| 256 B | 1,024 | 1.86% | 6.93% | 93.39% |
+| 1,024 B | 256 | 0.00% | 25.00% | 74.91% |
+| 4,096 B | 64 | 0.00% | 68.75% | 31.53% |
 
-Default/fitting use a 64 KiB data cache/node; exceeding/bandwidth use 4 KiB. The
-link is 32 GB/s except 2 GB/s for bandwidth-constrained runs. DLRM table sizes
-are respectively 256 KiB, 32 KiB, 512 KiB and 512 KiB. Other common inputs are
-3 accelerators + host, 8 outstanding requests/node, 200 ns accelerator compute,
-150 ns data-memory/peer service, 64B lines and 4 KiB regions. Defaults for the new
-home controller are 1,024 cached entries, four banks, 2 ns issue interval,
-16 miss buffers, 20 ns tag lookup, 80 ns additional miss service and a separate
-32 GB/s metadata backing channel.
+Percentages cover the **measured embedding window**. Accessor and mixed-block
+percentages count demand-touched blocks; miss attribution counts metadata misses
+from both demand permissions and data-cache eviction notices. Zero-write means
+zero observed writes in this window. Full-run write history is exported too.
+A 64B block cannot be spatially mixed by definition.
 
-The default controller has little bank queuing. Much of the larger benefit comes
-from avoiding metadata-cache misses, not a saturated controller port. The explicit
-one-bank controller stress case is reported separately. The model treats one
-metadata entry as one 64B transfer/cache line; packing several entries together
-could reduce misses and traffic and is currently unmodeled.
+At 4KiB, **44 of 64** touched pages mix written lines with lines that were only
+read; at 256B, **71 of 1,024** blocks do. The proportion of metadata misses on
+zero-write blocks falls from **98.51% at 64B** to **31.53% at 4KiB**. This exposes
+the cost of grouping unlike rows together, but does not establish an optimal
+policy or a speedup. The four sizes group one baseline's observations; they are
+not four simulated coherence protocols.
 
-[Complete results and sensitivity controls](PERFORMANCE_RESULTS.md) · [Model and limitations](MODEL.md)
+Great Lakes job **64818048** completed on **gl3039** with exit **0:0**
+(GCC 8.5.0, C++17 Release). All **11 CTest targets** and the **528,210-check**
+CSV/replay audit passed. All 139 output files match the local Release results
+byte for byte; ASan/UBSan validation also passed locally.
+
+[Full baseline results](PERFORMANCE_RESULTS.md) · [Model, definitions and limits](MODEL.md)
 
 ## Build and run
 
@@ -52,82 +48,91 @@ could reduce misses and traffic and is currently unmodeled.
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j4
 ctest --test-dir build --output-on-failure
+mkdir -p results/blind
 build/perf/architecture_perf --workload both --rounds 512 --warmup-rounds 128 \
-    --csv metrics.csv --kinds kinds.csv --phases phases.csv
+    --events 1 --output-prefix results/blind/default
+python3 scripts/audit_perf.py results/blind
 ```
 
-Use `--workload dlrm` or `--workload radix` for one workload. `--help` lists inputs.
-`--directory-model 0` reproduces the previous model; `--warmup-rounds 0` measures
-the complete run. A standalone build is available with `cmake -S perf -B build-perf`.
+`--workload dlrm` is the default; `radix` and `both` use the same hardware inputs.
+Use `--help` for all inputs. `--layout-seed` controls which table rows are hot;
+`--seed` controls requests. Set `--events 1` for an independently replayable log.
+Standalone build: `cmake -S perf -B build-perf -DCMAKE_BUILD_TYPE=Release`.
 
-On Great Lakes, submit from this repository root:
+On Great Lakes, submit from the repository root:
 
 ```bash
 sbatch perf/run_slurm.sh
 ```
 
-Or run against an existing build:
+To reproduce the full **14 baseline runs across 10 configurations**:
 
 ```bash
 bash perf/run_experiments.sh "$PWD/build/perf/architecture_perf"
-python3 scripts/audit_perf.py results/dlrm_refined
+python3 scripts/audit_perf.py results/blind
 ```
 
-The script writes **18 configurations** to `results/dlrm_refined/`: short and
-post-warm-up paired regimes, the legacy reference, directory capacity/throughput
-and miss-latency controls, and workload controls. The original
-`results/dlrm_comparison/` remains separate. Generated results and builds are
-Git-ignored; the Markdown tables are normal source files.
+The batch script builds, runs all tests, generates the experiments and audits the
+CSVs on a compute node. Results and builds are Git-ignored. Tables and model
+explanations in Markdown are tracked source files.
 
-## What changed
+## What the profiler measures
 
-- Directory probes use finite LRU metadata storage, address-hashed bank issue
-  slots, bounded outstanding misses and a queued backing channel. Pending fills
-  cannot be treated as immediate hits or evicted while incomplete.
-- Dirty metadata eviction writes permission records to backing memory; it never
-  fabricates data-cache invalidations. Bypass grants/recoveries use the same
-  controller resources as coherent line permissions.
-- Same-line and page dependencies wait for actual controller completion. Data,
-  controller and link state persist across a synchronized warm-up boundary.
-- CSVs expose whole-run and measured times, per-class/scoped cache statistics,
-  metadata hits/misses/merges, bank/miss-buffer/capacity/backing waits, and metadata
-  read/write traffic. Data traffic remains separate from directory backing traffic.
+- **Historical accessor counts:** blocks accessed by 1 through N+1 nodes,
+  including host node 0. These are window-wide unions, not simultaneous sharers.
+- **Read runs / write intervals:** exact consecutive-read counts and logarithmic
+  duration bins, with complete, leading, trailing and entirely censored samples.
+- **Spatial purity:** demand-touched blocks containing written lines, read-only
+  lines or both, independently at all four sizes.
+- **Directory miss attribution:** metadata misses on blocks with zero versus
+  positive writes, separated into demand/victim probes and measured/full history.
 
-DLRM retains the hot Zipf-skewed shared embeddings with host writes, scattered cold
-embeddings with rare updates, and private scratch reads/stores. Bottom MLP compute
-can overlap gathers; top MLP waits for the results. Radix retains its lead/fork,
-shared-prefix reads, private leaves and contended metadata. The same four scenarios
-remain: coherent baseline, selective bypass, naive coarse regions and a 50%
-KV/embedding event-overhead budget. No optimized predictor is implemented.
+All four are keyed by numeric addresses. `.kinds.csv` retains diagnostic access
+labels, but labels never choose caching, timing or histogram classification.
+`.blocks.csv` exposes underlying per-address counts. `.events.csv` records actual
+issue/admission/completion order, read versions and exact victim addresses.
+
+## Timing and memory model
+
+The scheduler admits a request using the current cache state and commits fills,
+writes and invalidations at actual completion. Pending fills consume finite cache
+capacity and cannot be read early. Timed queues therefore change the functional
+interleaving rather than replaying precomputed round-robin coherence events.
+
+Both workloads share finite fully associative data LRUs, bounded per-node memory
+parallelism, partial compute-memory overlap, a queued CXL link and a finite banked
+metadata cache with miss buffers and backing traffic. Host writes are concurrent
+with DLRM gathers; hot and cold rows are shuffled through one contiguous table.
+Private scratch remains a real per-accelerator allocation. These are synthetic
+MESI-style baseline measurements, not calibrated GPU/CXL timings.
 
 ## Source map
 
-| File | Role |
+| File | Responsibility |
 |---|---|
-| `perf/model.hpp` | Configuration, requests, scenarios and metrics |
-| `perf/directory.hpp`, `perf/directory.cpp` | Isolated home metadata cache, ports, miss buffers and backing resource |
-| `perf/model.cpp` | Radix generation, warm-up split and common discrete-event scheduler |
-| `perf/dlrm.cpp` | Seeded DLRM traces and paced host updates |
-| `perf/profile.cpp` | Finite data LRUs, reference MESI events and page-recovery effects |
-| `perf/scenarios.cpp` | Editable cost scenarios and trace fingerprint |
-| `perf/main.cpp` | CLI and scoped CSV exports |
-| `perf/*tests.cpp` | Analytic timing, caches, queue, overlap, recovery and warm-up tests |
-| `scripts/audit_perf.py` | CSV accounting, resource bounds and identical-hardware checks |
+| `perf/model.hpp` | Small configuration, request, transaction and metrics types |
+| `perf/workload.cpp`, `perf/dlrm.cpp` | Radix/DLRM generation and warm-up phases |
+| `perf/profile.hpp`, `perf/profile.cpp` | Incremental data caches, permissions and versions |
+| `perf/directory.hpp`, `perf/directory.cpp` | Metadata LRU, banks, miss buffers and backing channel |
+| `perf/model.cpp` | Event scheduling, bounded overlap and link timing |
+| `perf/histograms.hpp`, `perf/histograms.cpp` | Address-only distributions at four sizes |
+| `perf/report.cpp`, `perf/main.cpp` | CSV exports and CLI |
+| `perf/tests.cpp` | Ten functional, timing, layout and distribution checks |
+| `scripts/audit_perf.py` | Accounting audits and independent event replay |
 
-The legacy `radix_coherence` executable is preserved independently. The performance
-frontend only uses its baseline directory path to obtain data-cache/coherence events.
+The original `radix_coherence` predictor/state-machine executable is preserved
+independently. The performance library does not link to it.
 
-## Validation and limits
+## Validation
 
-All **14 CTest targets** passed on Great Lakes (GCC 8.5.0, job **64801017**, gl3018)
-and locally with AddressSanitizer/UndefinedBehaviorSanitizer. The three extra
-miss-latency controls passed in job **64801186**, gl3230. Both jobs completed with
-exit **0:0**. **7,018 CSV checks** passed across all 18 configurations.
+Local ASan/UBSan: **11/11 CTest targets passed**, including seven legacy targets
+and four baseline targets. The experiment audit passed **528,210 checks across
+14 runs** and independently replayed **131,660 timed requests**. Tests include
+latency-driven changes to observed data versions and coherence events, reserved
+fill capacity, dirty ownership transfer, warm-up persistence, exact toy histograms
+and invariance to diagnostic label changes.
 
-The main remaining limitation is that functional data-cache/coherence profiling
-still uses a fixed logical interleaving; timing does not reorder those reference
-events. The new directory cache/queues are timed, but this is not a cycle-accurate
-protocol implementation. Link request/response timing is lumped, directory backing
-and data memory are separate resources, and directory layout/costs need calibration.
-Post-warm-up does not guarantee a stationary working set. Absolute times across
-DLRM and Radix do different work. See `MODEL.md` for the full interpretation.
+The distributions suggest candidate block sizes and phase thresholds. Choosing a
+policy still requires correctness rules, transition/recovery costs, predictor
+errors and validation on real workloads. [MODEL.md](MODEL.md) specifies denominators,
+censoring and the remaining timing approximations.
