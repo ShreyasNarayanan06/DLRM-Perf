@@ -15,3 +15,9 @@ performance_tests
 dlrm_tests
 directory_tests
 cpu_coherence_probe
+
+# Python analysis caches
+__pycache__/
+*.py[cod]
+
+management_tests

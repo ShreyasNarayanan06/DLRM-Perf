@@ -1,6 +1,7 @@
 #include "simulator.hpp"
 #include "profile.hpp"
 #include "directory.hpp"
+#include "management.hpp"
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -12,7 +13,7 @@
 
 namespace perf {
 namespace {
-enum class Kind { ComputeDone,StartBatch,TryAccess,DirectoryArrive,DirectoryProbe,DataReady,Complete,Join };
+enum class Kind { ComputeDone,StartBatch,TryAccess,DirectoryArrive,DirectoryIssue,DirectoryProbe,DataReady,Complete,Join,RegionChanged };
 struct Event {
     double time;std::uint64_t order;std::size_t stream,step;Kind kind;
     std::size_t access=0,operation=0;
@@ -30,7 +31,7 @@ struct StepState {
     std::vector<RequestState> requests;
 };
 }
-Result simulate(const Workload& workload,const Config& c,BlindProfiler& profiler) {
+Result simulate(const Workload& workload,const Config& c,BlindProfiler& profiler,ManagementModel* management) {
     c.validate();Result result;result.workload=c.workload;result.trace_fingerprint=workload_fingerprint(workload);
     BaselineMemory memory(c);DirectoryModel directory(c);
     double link_available=0;std::uint64_t order=0,request_id=0,admission_order=0;std::size_t outstanding=0;
@@ -72,17 +73,40 @@ Result simulate(const Workload& workload,const Config& c,BlindProfiler& profiler
             const auto& stream=phase.streams[e.stream];const auto& step=stream.steps[e.step];auto& state=states[e.stream][e.step];
             if(e.kind==Kind::TryAccess) {
                 auto& request=state.requests[e.access];const auto& access=step.accesses[e.access];
-                if(!memory.admit(stream.node,access,request.transaction,request.id)) {blocked_requests.push_back(e);continue;}
+                if(management) {
+                    const auto gate=management->gate(access.address);
+                    if(gate==ManagementModel::Gate::Blocked) {blocked_requests.push_back(e);continue;}
+                    if(gate==ManagementModel::Gate::Change) {
+                        const auto change=management->begin_change(access.address,e.time,phase.measured,memory);
+                        const auto done=network(e.time,management->change_bytes(change))+management->change_service(change);
+                        result.control_bytes+=management->config().transition_message_bytes+
+                            management->config().record_bytes*static_cast<double>(change.resident_lines);
+                        result.writeback_bytes+=64*static_cast<double>(change.dirty_lines);
+                        events.push({done,order++,e.stream,e.step,Kind::RegionChanged,e.access});continue;
+                    }
+                }
+                const std::function<bool(std::uint64_t)> victim_allowed=management ?
+                    std::function<bool(std::uint64_t)>([&](std::uint64_t address){return management->victim_allowed(address);}) :
+                    std::function<bool(std::uint64_t)>{};
+                if(!memory.admit(stream.node,access,request.transaction,request.id,victim_allowed)) {blocked_requests.push_back(e);continue;}
                 request.admitted=e.time;request.admission_order=++admission_order;request.transaction.measured=phase.measured;
+                if(management)management->admitted(request.transaction);
                 result.dependency_wait_ns+=e.time-request.issued;
                 profiler.access(e.time,stream.node,access.address,access.write,phase.measured);
                 const auto& t=request.transaction.traffic;
-                const auto controls=static_cast<double>(t.directory)*c.directory_bytes+static_cast<double>(t.evictions)*8;
+                const auto controls=static_cast<double>(t.directory)*c.directory_bytes+static_cast<double>(t.evictions)*8+
+                    (management ? management->request_bytes(request.transaction) : 0);
                 result.control_bytes+=controls;
-                events.push({network(e.time,controls),order++,e.stream,e.step,Kind::DirectoryArrive,e.access});
+                events.push({network(e.time+(management ? management->check_ns() : 0),controls),order++,e.stream,e.step,Kind::DirectoryArrive,e.access});
                 continue;
             }
-            if(e.kind==Kind::DirectoryArrive || e.kind==Kind::DirectoryProbe) {
+            if(e.kind==Kind::RegionChanged) {
+                management->finish_change(step.accesses[e.access].address,e.time,memory);
+                events.push({e.time,order++,e.stream,e.step,Kind::TryAccess,e.access});
+                for(auto waiter:blocked_requests) {waiter.time=e.time;waiter.order=order++;events.push(waiter);}blocked_requests.clear();
+                continue;
+            }
+            if(e.kind==Kind::DirectoryArrive || e.kind==Kind::DirectoryIssue || e.kind==Kind::DirectoryProbe) {
                 auto& request=state.requests[e.access];const auto& tx=request.transaction;
                 if(e.operation==tx.operations.size()) {
                     const auto& t=tx.traffic;
@@ -92,7 +116,13 @@ Result simulate(const Workload& workload,const Config& c,BlindProfiler& profiler
                     events.push({e.time+base+protocol,order++,e.stream,e.step,Kind::DataReady,e.access});continue;
                 }
                 const auto& op=tx.operations[e.operation];const auto key=DirectoryModel::line_key(op.address);
-                if(e.kind==Kind::DirectoryArrive) {
+                if(e.kind==Kind::DirectoryArrive && management) {
+                    const auto ready=management->operation_ready(e.time,op.address,phase.measured);
+                    if(ready>e.time) {
+                        events.push({ready,order++,e.stream,e.step,Kind::DirectoryIssue,e.access,e.operation});continue;
+                    }
+                }
+                if(e.kind==Kind::DirectoryArrive || e.kind==Kind::DirectoryIssue) {
                     const auto issue=directory.reserve(e.time,key,op.kind);
                     events.push({issue,order++,e.stream,e.step,Kind::DirectoryProbe,e.access,e.operation});
                 } else {
@@ -108,7 +138,8 @@ Result simulate(const Workload& workload,const Config& c,BlindProfiler& profiler
             }
             if(e.kind==Kind::DataReady) {
                 const auto& t=state.requests[e.access].transaction.traffic;
-                const auto controls=static_cast<double>(t.snoops)*c.snoop_bytes+static_cast<double>(t.invalidations)*c.invalidate_bytes;
+                const auto controls=static_cast<double>(t.snoops)*c.snoop_bytes+static_cast<double>(t.invalidations)*c.invalidate_bytes+
+                    (management ? management->response_bytes(state.requests[e.access].transaction) : 0);
                 const auto data=static_cast<double>(t.fills)*64,writeback=static_cast<double>(t.writebacks)*64;
                 result.data_bytes+=data;result.writeback_bytes+=writeback;result.control_bytes+=controls;
                 events.push({network(e.time,data+writeback+controls),order++,e.stream,e.step,Kind::Complete,e.access});continue;
@@ -116,6 +147,7 @@ Result simulate(const Workload& workload,const Config& c,BlindProfiler& profiler
             if(e.kind==Kind::Complete) {
                 auto& request=state.requests[e.access];const auto version=memory.complete(request.transaction);
                 accumulate(result,request.transaction);
+                if(management)management->completed(request.transaction);
                 if(c.capture_events) {
                     EventRecord record;record.id=request.id;record.admission_order=request.admission_order;record.node=stream.node;record.address=request.transaction.access.address;
                     record.kind=request.transaction.access.kind;record.write=request.transaction.access.write;record.measured=phase.measured;

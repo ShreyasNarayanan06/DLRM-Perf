@@ -1,5 +1,8 @@
 # Timed baseline profiling results
 
+These tables describe the original always-hardware address profiler. The new
+software/hardware/dynamic comparison is in [COMPARISON_RESULTS.md](COMPARISON_RESULTS.md).
+
 Great Lakes job **64818048** completed on **gl3039** with exit **0:0**
 (GCC 8.5.0, C++17 Release). All **11 CTest targets** and the **528,210-check**
 CSV/replay audit passed. All 139 output files match the local Release results

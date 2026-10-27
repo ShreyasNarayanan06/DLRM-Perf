@@ -29,7 +29,8 @@ void BaselineMemory::check(const Line& value) const {
         if((value.holders&(1ULL<<n))!=0 && value.versions[n]!=value.latest)
             throw std::logic_error("cached data is stale");
 }
-bool BaselineMemory::admit(std::size_t node,const Access& access,Transaction& transaction,std::uint64_t ticket) {
+bool BaselineMemory::admit(std::size_t node,const Access& access,Transaction& transaction,std::uint64_t ticket,
+                           const std::function<bool(std::uint64_t)>& victim_allowed) {
     if(node>c_.agents || access.address%64!=0) throw std::invalid_argument("invalid node/alignment");
     auto& target=line(access.address,access.kind);
     const auto bit=1ULL<<node;
@@ -49,7 +50,7 @@ bool BaselineMemory::admit(std::size_t node,const Access& access,Transaction& tr
         auto victim=cache.lru.rbegin();
         for(;victim!=cache.lru.rend();++victim) {
             const auto& candidate=lines_.at(*victim);
-            if(!candidate.exclusive && candidate.readers==0) break;
+            if(!candidate.exclusive && candidate.readers==0 && (!victim_allowed || victim_allowed(*victim))) break;
         }
         if(victim==cache.lru.rend()) return false;
         tx.has_victim=true;tx.victim=*victim;
@@ -117,6 +118,23 @@ std::uint64_t BaselineMemory::complete(const Transaction& tx) {
     }
     if(tx.traffic.hits!=0 && !tx.access.write) --target.readers;else target.exclusive=false;
     check(target);return target.latest;
+}
+std::pair<std::size_t,std::size_t> BaselineMemory::region_contents(std::uint64_t region,std::size_t bytes) const {
+    std::size_t resident=0,dirty=0;
+    for(const auto& item:lines_)if(item.first/bytes==region) {
+        resident+=item.second.holders!=0 ? 1U : 0U;dirty+=item.second.dirty ? 1U : 0U;
+    }
+    return {resident,dirty};
+}
+std::size_t BaselineMemory::flush_region(std::uint64_t region,std::size_t bytes) {
+    std::size_t dirty=0;
+    for(auto& item:lines_)if(item.first/bytes==region) {
+        auto& line=item.second;
+        if(line.exclusive || line.readers!=0)throw std::logic_error("flush raced with region access");
+        if(line.dirty) {++dirty;line.memory=line.latest;line.dirty=false;}
+        check(line);
+    }
+    return dirty;
 }
 void accumulate(Result& r,const Transaction& tx) {
     const auto add=[&](std::array<Traffic,kind_count>& kinds) {

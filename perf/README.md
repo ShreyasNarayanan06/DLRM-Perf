@@ -1,9 +1,11 @@
-# Timed baseline memory profiler
+# Performance simulation
 
-`architecture_perf` runs DLRM, RadixTree or both with incremental finite data caches,
-MESI-style permissions, a finite directory and a queued CXL link. There is no
-static round-robin coherence prepass. The performance library is independent of
-the original `radix_coherence` predictor/state-machine executable.
+The simulator has two uses:
+
+1. **Compare ways to keep shared embedding copies current.** Run with
+   `--management compare` for software-managed, always-hardware and dynamic modes.
+2. **Profile the original hardware baseline.** Omit `--management` to retain the
+   prior address distributions and output format.
 
 From the repository root:
 
@@ -11,50 +13,33 @@ From the repository root:
 cmake -S perf -B build-perf -DCMAKE_BUILD_TYPE=Release
 cmake --build build-perf -j4
 ctest --test-dir build-perf --output-on-failure
-mkdir -p results/example
-build-perf/architecture_perf --workload both --rounds 512 --warmup-rounds 128 \
-    --events 1 --output-prefix results/example/default
-python3 scripts/audit_perf.py results/example
+mkdir -p results/management
+build-perf/architecture_perf --management compare --rounds 512 --warmup-rounds 128 \
+    --events 1 --output-prefix results/management/example
+bash perf/run_comparisons.sh "$PWD/build-perf/architecture_perf"
+python3 scripts/audit_comparison.py results/management
 ```
 
-`--output-prefix results/example/default` writes separate `default.dlrm.*` and
-`default.radix.*` exports. Parent directories must exist. `--help` lists hardware,
-generator and timing inputs. `--seed` selects requests and `--layout-seed` selects
-the placement of hot/cold ranks within one contiguous DLRM table.
+For Great Lakes, use `sbatch perf/run_comparison_slurm.sh` from the repository
+root. The script builds the full project, tests, runs all comparisons and audits.
+`--help` lists inputs; `--software-ns`, `--region-bytes`, `--region-entries` and
+`--transition-ns` are useful controls. These are assumptions to test, not tuned
+values established by hardware measurements.
 
-Reproduce all 14 baseline runs:
+The original profiler is still available:
 
 ```bash
 bash perf/run_experiments.sh "$PWD/build-perf/architecture_perf"
 python3 scripts/audit_perf.py results/blind
 ```
 
-On Great Lakes, the repository-root batch script builds the whole project,
-runs 11 CTest targets, executes the experiments and audits the results:
+`--workload dlrm|radix|both` uses a shared event scheduler and hardware inputs.
+Requests update cache/copy state during execution. There is no static round-robin
+coherence prepass. Hot/cold rows share a shuffled contiguous DLRM table, and all
+address histograms ignore diagnostic labels.
 
-```bash
-sbatch perf/run_slurm.sh
-```
+[Plain-English project guide](../README.md) · [Comparison results](../COMPARISON_RESULTS.md) ·
+[Comparison details](../COMPARISON_MODEL.md) · [Original profiler details](../MODEL.md)
 
-Address distributions are exported at 64B, 256B, 1KiB and 4KiB: historical distinct
-accessors, exact read runs, time between writes, spatial purity and directory-miss
-write attribution. They use numeric addresses rather than hot/cold labels.
-Scopes distinguish full/measurement windows and all-memory/embedding-table views.
-`--events 1` enables a replayable timed trace. The audit script independently
-reconstructs distributions and committed data versions from those events.
-
-See [../README.md](../README.md) for results, [../MODEL.md](../MODEL.md) for exact
-sample definitions and [../PERFORMANCE_RESULTS.md](../PERFORMANCE_RESULTS.md) for
-regime tables and validation. The active frontend has a single coherent baseline;
-previous scenario flags and CSV flags have been replaced by `--output-prefix`.
-
-Address-only row popularity and a separate calibrated full-Zipf sample:
-
-```bash
-python3 scripts/profile_embedding_skew.py \
-    --metrics results/blind/default.dlrm.metrics.csv \
-    --events results/blind/default.dlrm.events.csv \
-    --output-prefix results/blind/skew
-```
-
-See [../SKEW_PROFILE.md](../SKEW_PROFILE.md) for the 80/5 check and its limits.
+[Access-skew analysis](../SKEW_PROFILE.md) includes the standalone Python
+`profile_embedding_skew.py` tool. It does not replace the timed workload generator.

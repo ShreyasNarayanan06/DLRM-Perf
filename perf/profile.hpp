@@ -1,17 +1,22 @@
 #pragma once
 #include "model.hpp"
 #include <list>
+#include <functional>
 #include <unordered_map>
 
 namespace perf {
-// Incremental baseline MESI data state. No page hints, hot/cold rules or trace
-// prepass. A successful admission reserves cache capacity and compatible locks;
+// Incremental owner/copy state shared by the hardware reference and explicit
+// software protocol. The scheduler selects the manager and its costs. No heat
+// labels or trace prepass are used here. A successful admission reserves cache capacity and compatible locks;
 // permissions/data become visible only at complete().
 class BaselineMemory {
 public:
     explicit BaselineMemory(const Config& config);
-    bool admit(std::size_t node,const Access& access,Transaction& transaction,std::uint64_t ticket=1);
+    bool admit(std::size_t node,const Access& access,Transaction& transaction,std::uint64_t ticket=1,
+               const std::function<bool(std::uint64_t)>& victim_allowed={});
     std::uint64_t complete(const Transaction& transaction);
+    std::pair<std::size_t,std::size_t> region_contents(std::uint64_t region,std::size_t bytes) const;
+    std::size_t flush_region(std::uint64_t region,std::size_t bytes);
     std::size_t peak_cache_lines() const { return peak_cache_lines_; }
 private:
     struct Line {

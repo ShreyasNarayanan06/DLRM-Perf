@@ -1,9 +1,11 @@
 # Timed baseline profiler: definitions and limits
 
-`architecture_perf` now runs **one always-coherent MESI-style baseline**, then
-analyzes its observed addresses at 64B, 256B, 1KiB and 4KiB. There are no scenario
-fractions, predictor hints, page bypass modes, speculative speedups or state-change
-budgets in this frontend. The block sizes are analysis lenses over the same 64B
+`architecture_perf` defaults to an **always-coherent MESI-style baseline**, then
+analyzes its observed addresses at 64B, 256B, 1KiB and 4KiB. The address profiler
+has no percentage-based speedup scenarios. The optional
+`--management compare` experiment now adds explicit software/hardware management
+and timed region handoffs; see [COMPARISON_MODEL.md](COMPARISON_MODEL.md).
+The block sizes are analysis lenses over the same 64B
 baseline, not four simulated coherence protocols. The independent original
 `radix_coherence` executable remains a legacy project and is not used by `perf/`.
 

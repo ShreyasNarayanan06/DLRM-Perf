@@ -1,138 +1,94 @@
-# DLRM / RadixTree baseline memory profiler
+# DLRM shared-memory experiment
 
-The timed baseline now uses **one mixed embedding address space** and updates
-finite caches and MESI permissions during execution. The old counterfactual
-scenarios have been removed from `perf/`. Its outputs describe the workload at
-64B, 256B, 1KiB and 4KiB so a coherence policy can be designed from observations.
+**What are we testing?** When several accelerators use the same embedding table,
+can hardware save time by keeping their local copies up to date, instead of
+leaving that work to software? Does choosing where to use hardware help?
 
-**Access-skew check:** the hottest 205 of 4,096 rows (about 5%) account for
-**79.96% of measured logical embedding reads**. A standalone full-table Zipf
-sampler can also be calibrated to an exact 80% target.
-[Distribution, sample validation and reproduction commands](SKEW_PROFILE.md).
+This C++17 simulator estimates the time and communication needed for that work.
+It does not run a real DLRM model on GPUs.
 
-## First results: mixed DLRM embeddings
+## What we compare
 
-Default: 3 accelerators + host, 512 batches, 128 warm-up batches, 64KiB data
-cache/node, 256KiB embedding table, request seed 42, layout seed 7.
+| System | How it keeps copies up to date |
+|---|---|
+| **Software-managed baseline** | Hardware does not automatically coordinate copies. Software tracks who has them and sends requests when sharing or writes require coordination. Valid cached reads stay fast. |
+| **Always-on hardware coherence** | Hardware automatically tracks sharing and writes for individual cache lines. This is an additional reference. |
+| **Dynamic reference** | Starts with software management. When a region repeatedly needs coordination across nodes, it enables hardware tracking there. It returns to software after a quiet period. |
 
-| Analysis block size | Touched blocks | One historical accessor | Mixed written/read-only lines | Metadata misses on zero-write blocks |
-|---|---:|---:|---:|---:|
-| 64 B | 3,485 | 42.93% | 0.00% | 98.51% |
-| 256 B | 1,024 | 1.86% | 6.93% | 93.39% |
-| 1,024 B | 256 | 0.00% | 25.00% | 74.91% |
-| 4,096 B | 64 | 0.00% | 68.75% | 31.53% |
+All three must return correct, current data. “Non-coherent” does not mean old
+values are allowed. The dynamic approach is a replaceable example, not a final
+research policy.
 
-Percentages cover the **measured embedding window**. Accessor and mixed-block
-percentages count demand-touched blocks; miss attribution counts metadata misses
-from both demand permissions and data-cache eviction notices. Zero-write means
-zero observed writes in this window. Full-run write history is exported too.
-A 64B block cannot be spatially mixed by definition.
+## What the workload does
 
-At 4KiB, **44 of 64** touched pages mix written lines with lines that were only
-read; at 256B, **71 of 1,024** blocks do. The proportion of metadata misses on
-zero-write blocks falls from **98.51% at 64B** to **31.53% at 4KiB**. This exposes
-the cost of grouping unlike rows together, but does not establish an optimal
-policy or a speedup. The four sizes group one baseline's observations; they are
-not four simulated coherence protocols.
+Three accelerators process recommendation batches. Each batch gathers embedding
+rows, represents the dense MLP and combining work with a compute delay, and uses
+private scratch space. Individual tensor operations are not simulated.
 
-Great Lakes job **64818048** completed on **gl3039** with exit **0:0**
-(GCC 8.5.0, C++17 Release). All **11 CTest targets** and the **528,210-check**
-CSV/replay audit passed. All 139 output files match the local Release results
-byte for byte; ASan/UBSan validation also passed locally.
+About 80% of embedding reads target a popular 5% of the rows. Popular and less
+popular rows are mixed throughout the table. A CPU updates some rows while the
+accelerators run. This represents **serving recommendations with concurrent
+updates**, rather than a complete multi-GPU training job.
 
-[Full baseline results](PERFORMANCE_RESULTS.md) · [Model, definitions and limits](MODEL.md)
+Every system gets the same request program, cache sizes, link speed and compute
+work. Some work can overlap. The simulator charges for communication, waiting,
+software handling and switching a region's manager, including writing back any
+changed data first. It checks that reads do not use outdated copies.
 
-## Build and run
+## Current results
+
+The default comparison uses 512 batches and 4KB regions. The first 128 batches
+warm the caches; the table shows the remaining simulated execution time.
+
+| System | Time (microseconds) | Less time than software baseline |
+|---|---:|---:|
+| Software-managed baseline | 409.40 | 0.0% |
+| Always-on hardware coherence | 220.96 | 46.0% |
+| Dynamic reference | 246.78 | 39.7% |
+
+**The software-cost assumption matters.** Here, each request handled by the
+software copy manager needs an extra **100 ns** of processing, plus a message
+envelope. These costs are inputs, not measurements of today's GPU systems.
+At **25 ns**, the dynamic saving falls to **6.9%**. If both extra software costs
+are zero, dynamic is **3.4% slower**. With 256-byte regions and the same tracking
+capacity, it is **1.3% slower** under the default software cost.
+
+Always-on hardware is fastest in the default case. These results show a possible
+benefit over one software-managed shared-memory design; they are **not measured
+speedups over TorchRec, NCCL or a production GPU fleet**.
+
+[All results and controls](COMPARISON_RESULTS.md) · [Detailed assumptions](COMPARISON_MODEL.md)
+
+## Run the experiment
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j4
 ctest --test-dir build --output-on-failure
-mkdir -p results/blind
-build/perf/architecture_perf --workload both --rounds 512 --warmup-rounds 128 \
-    --events 1 --output-prefix results/blind/default
-python3 scripts/audit_perf.py results/blind
+mkdir -p results/management
+build/perf/architecture_perf --management compare --rounds 512 --warmup-rounds 128 \
+    --events 1 --output-prefix results/management/example
 ```
 
-`--workload dlrm` is the default; `radix` and `both` use the same hardware inputs.
-Use `--help` for all inputs. `--layout-seed` controls which table rows are hot;
-`--seed` controls requests. Set `--events 1` for an independently replayable log.
-Standalone build: `cmake -S perf -B build-perf -DCMAKE_BUILD_TYPE=Release`.
+The terminal prints the three times. CSV files record cache use, communication,
+software/hardware tracking work and region changes. Positive “less time” means an
+improvement; negative means a slowdown.
 
-On Great Lakes, submit from the repository root:
+On Great Lakes, submit from this repository's directory:
 
 ```bash
-sbatch perf/run_slurm.sh
+sbatch perf/run_comparison_slurm.sh
 ```
 
-To reproduce the full **14 baseline runs across 10 configurations**:
+This builds, tests, runs all **17 comparisons** and audits the results in
+`results/management/`. Local reproduction commands are in the results document.
 
-```bash
-bash perf/run_experiments.sh "$PWD/build/perf/architecture_perf"
-python3 scripts/audit_perf.py results/blind
-```
+## Further reading
 
-The batch script builds, runs all tests, generates the experiments and audits the
-CSVs on a compute node. Results and builds are Git-ignored. Tables and model
-explanations in Markdown are tracked source files.
+The original profiler and Multi-Agent RadixTree workload remain available.
 
-## What the profiler measures
+[Original profiles](PERFORMANCE_RESULTS.md) · [Access-skew check](SKEW_PROFILE.md) · [Profiler details](MODEL.md)
 
-- **Historical accessor counts:** blocks accessed by 1 through N+1 nodes,
-  including host node 0. These are window-wide unions, not simultaneous sharers.
-- **Read runs / write intervals:** exact consecutive-read counts and logarithmic
-  duration bins, with complete, leading, trailing and entirely censored samples.
-- **Spatial purity:** demand-touched blocks containing written lines, read-only
-  lines or both, independently at all four sizes.
-- **Directory miss attribution:** metadata misses on blocks with zero versus
-  positive writes, separated into demand/victim probes and measured/full history.
-
-All four are keyed by numeric addresses. `.kinds.csv` retains diagnostic access
-labels, but labels never choose caching, timing or histogram classification.
-`.blocks.csv` exposes underlying per-address counts. `.events.csv` records actual
-issue/admission/completion order, read versions and exact victim addresses.
-
-## Timing and memory model
-
-The scheduler admits a request using the current cache state and commits fills,
-writes and invalidations at actual completion. Pending fills consume finite cache
-capacity and cannot be read early. Timed queues therefore change the functional
-interleaving rather than replaying precomputed round-robin coherence events.
-
-Both workloads share finite fully associative data LRUs, bounded per-node memory
-parallelism, partial compute-memory overlap, a queued CXL link and a finite banked
-metadata cache with miss buffers and backing traffic. Host writes are concurrent
-with DLRM gathers; hot and cold rows are shuffled through one contiguous table.
-Private scratch remains a real per-accelerator allocation. These are synthetic
-MESI-style baseline measurements, not calibrated GPU/CXL timings.
-
-## Source map
-
-| File | Responsibility |
-|---|---|
-| `perf/model.hpp` | Small configuration, request, transaction and metrics types |
-| `perf/workload.cpp`, `perf/dlrm.cpp` | Radix/DLRM generation and warm-up phases |
-| `perf/profile.hpp`, `perf/profile.cpp` | Incremental data caches, permissions and versions |
-| `perf/directory.hpp`, `perf/directory.cpp` | Metadata LRU, banks, miss buffers and backing channel |
-| `perf/model.cpp` | Event scheduling, bounded overlap and link timing |
-| `perf/histograms.hpp`, `perf/histograms.cpp` | Address-only distributions at four sizes |
-| `perf/report.cpp`, `perf/main.cpp` | CSV exports and CLI |
-| `perf/tests.cpp` | Ten functional, timing, layout and distribution checks |
-| `scripts/audit_perf.py` | Accounting audits and independent event replay |
-
-The original `radix_coherence` predictor/state-machine executable is preserved
-independently. The performance library does not link to it.
-
-## Validation
-
-Local ASan/UBSan: **11/11 CTest targets passed**, including seven legacy targets
-and four baseline targets. The experiment audit passed **528,210 checks across
-14 runs** and independently replayed **131,660 timed requests**. Tests include
-latency-driven changes to observed data versions and coherence events, reserved
-fill capacity, dirty ownership transfer, warm-up persistence, exact toy histograms
-and invariance to diagnostic label changes.
-
-The distributions suggest candidate block sizes and phase thresholds. Choosing a
-policy still requires correctness rules, transition/recovery costs, predictor
-errors and validation on real workloads. [MODEL.md](MODEL.md) specifies denominators,
-censoring and the remaining timing approximations.
+Validation: **14/14 tests passed** on Great Lakes (job **64831183**, gl3018) and
+under local memory/error checks. The audit verifies fresh reads and communication
+accounting. All **550 cluster output files** match the local results.
